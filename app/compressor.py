@@ -17,14 +17,14 @@ class CompressionPreset:
     dpi: int
     jpeg_quality: int
     grayscale: bool
-    optimize: bool = True
-    progressive: bool = True
+    optimize: bool = False
+    progressive: bool = False
 
 
 PRESETS: dict[CompressionLevel, CompressionPreset] = {
-    "light": CompressionPreset(dpi=170, jpeg_quality=70, grayscale=False),
-    "recommended": CompressionPreset(dpi=130, jpeg_quality=52, grayscale=False),
-    "strong": CompressionPreset(dpi=105, jpeg_quality=36, grayscale=True),
+    "light": CompressionPreset(dpi=150, jpeg_quality=68, grayscale=False),
+    "recommended": CompressionPreset(dpi=110, jpeg_quality=46, grayscale=False),
+    "strong": CompressionPreset(dpi=90, jpeg_quality=30, grayscale=True),
 }
 
 
@@ -112,6 +112,6 @@ def raster_compress_pdf(source_bytes: bytes, level: str) -> tuple[bytes, dict[st
         "x-original-size": format_bytes(len(source_bytes)),
         "x-output-size": format_bytes(len(result_bytes)),
         "x-percent-saved": str(percent_saved(len(source_bytes), len(result_bytes))),
-        "x-effective-stage": f"raster-{get_preset(level)}",
+        "x-effective-stage": f"raster-fast-{get_preset(level)}",
     }
     return result_bytes, stats
