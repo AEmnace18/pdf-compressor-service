@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import logging
+import time
 from io import BytesIO
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.compressor import raster_compress_pdf
 
 MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
 
-app = FastAPI(title="PDF Compressor Prototype", version="0.1.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="PDF Compressor Prototype", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +33,7 @@ app.add_middleware(
         "x-output-size",
         "x-percent-saved",
         "x-effective-stage",
+        "x-processing-seconds",
     ],
 )
 
@@ -56,6 +63,8 @@ async def compress(
     level: str = Form("recommended"),
     filename: str = Form("compressed-document.pdf"),
 ):
+    request_started = time.perf_counter()
+
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
@@ -63,7 +72,27 @@ async def compress(
     if len(source_bytes) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(status_code=400, detail="File exceeds the 25 MB limit.")
 
-    output_bytes, stats = raster_compress_pdf(source_bytes, level)
+    logger.info(
+        "request:start filename=%s level=%s size=%s",
+        file.filename,
+        level,
+        format_bytes(len(source_bytes)),
+    )
+
+    try:
+        output_bytes, stats = await run_in_threadpool(raster_compress_pdf, source_bytes, level)
+    except Exception as exc:
+        logger.exception("request:failed filename=%s", file.filename)
+        raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
+
+    total_seconds = time.perf_counter() - request_started
+    logger.info(
+        "request:done filename=%s input=%s output=%s total_seconds=%.2f",
+        file.filename,
+        format_bytes(len(source_bytes)),
+        format_bytes(len(output_bytes)),
+        total_seconds,
+    )
 
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -72,6 +101,7 @@ async def compress(
         "x-output-size": format_bytes(len(output_bytes)),
         "x-percent-saved": str(percent_saved(len(source_bytes), len(output_bytes))),
         "x-effective-stage": stats.get("x-effective-stage", "unknown"),
+        "x-processing-seconds": stats.get("x-processing-seconds", f"{total_seconds:.2f}"),
     }
 
     return StreamingResponse(
