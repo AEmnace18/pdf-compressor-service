@@ -79,3 +79,4 @@ async def compress(
         media_type="application/pdf",
         headers=headers,
     )
+}
