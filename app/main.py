@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from io import BytesIO
@@ -12,11 +13,12 @@ from starlette.concurrency import run_in_threadpool
 from app.compressor import raster_compress_pdf
 
 MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
+MAX_CONCURRENT_COMPRESSIONS = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PDF Compressor Prototype", version="0.2.0")
+app = FastAPI(title="PDF Compressor Prototype", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,6 +38,8 @@ app.add_middleware(
         "x-processing-seconds",
     ],
 )
+
+compression_slots = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -80,10 +84,21 @@ async def compress(
     )
 
     try:
+        await asyncio.wait_for(compression_slots.acquire(), timeout=0.25)
+    except TimeoutError:
+        logger.warning("request:busy filename=%s", file.filename)
+        raise HTTPException(
+            status_code=429,
+            detail="Server is busy. Up to 3 PDF compression jobs can run at once. Please try again in a moment.",
+        )
+
+    try:
         output_bytes, stats = await run_in_threadpool(raster_compress_pdf, source_bytes, level)
     except Exception as exc:
         logger.exception("request:failed filename=%s", file.filename)
         raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
+    finally:
+        compression_slots.release()
 
     total_seconds = time.perf_counter() - request_started
     logger.info(
