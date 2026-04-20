@@ -1,126 +1,152 @@
-from __future__ import annotations
+import os
+import tempfile
+from pathlib import Path
 
-import asyncio
-import logging
-import time
-from io import BytesIO
-
+import pikepdf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from starlette.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse
 
-from app.compressor import raster_compress_pdf
-
+APP_NAME = "DILG SDN PDF Compressor"
 MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
-MAX_CONCURRENT_COMPRESSIONS = 3
+DEFAULT_ORIGINS = [
+    "https://dilgsdn.com",
+    "https://www.dilgsdn.com",
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-logger = logging.getLogger(__name__)
+def parse_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if not raw.strip():
+        return DEFAULT_ORIGINS
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-app = FastAPI(title="PDF Compressor Prototype", version="0.3.0")
+app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://dilgsdnworksite.vercel.app",
-    ],
+    allow_origins=parse_allowed_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
+        "Content-Disposition",
         "x-output-filename",
         "x-original-size",
         "x-output-size",
         "x-percent-saved",
-        "x-effective-stage",
-        "x-processing-seconds",
+        "x-bytes-saved",
     ],
+    max_age=86400,
 )
 
-compression_slots = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
-
-def format_bytes(num_bytes: int) -> str:
-    if num_bytes < 1024:
-        return f"{num_bytes} B"
-    if num_bytes < 1024 * 1024:
-        return f"{num_bytes / 1024:.1f} KB"
-    return f"{num_bytes / (1024 * 1024):.2f} MB"
-
-
-def percent_saved(before: int, after: int) -> int:
-    if before <= 0:
-        return 0
-    return max(0, round(((before - after) / before) * 100))
+@app.get("/")
+def root():
+    return {
+        "service": APP_NAME,
+        "status": "ok",
+        "compress_endpoint": "/compress",
+        "health_endpoint": "/health",
+    }
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health():
     return {"status": "ok"}
 
 
-@app.post("/compress")
-async def compress(
-    file: UploadFile = File(...),
-    level: str = Form("recommended"),
-    filename: str = Form("compressed-document.pdf"),
-):
-    request_started = time.perf_counter()
+def ensure_pdf_name(value: str) -> str:
+    cleaned = (value or "compressed-document.pdf").strip()
+    cleaned = "".join("-" if c in '\\/:*?"<>|' else c for c in cleaned)
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned += ".pdf"
+    return cleaned
 
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    source_bytes = await file.read()
-    if len(source_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=400, detail="File exceeds the 25 MB limit.")
-
-    logger.info(
-        "request:start filename=%s level=%s size=%s",
-        file.filename,
-        level,
-        format_bytes(len(source_bytes)),
-    )
-
-    try:
-        await asyncio.wait_for(compression_slots.acquire(), timeout=0.25)
-    except TimeoutError:
-        logger.warning("request:busy filename=%s", file.filename)
-        raise HTTPException(
-            status_code=429,
-            detail="Server is busy. Up to 3 PDF compression jobs can run at once. Please try again in a moment.",
-        )
-
-    try:
-        output_bytes, stats = await run_in_threadpool(raster_compress_pdf, source_bytes, level)
-    except Exception as exc:
-        logger.exception("request:failed filename=%s", file.filename)
-        raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
-    finally:
-        compression_slots.release()
-
-    total_seconds = time.perf_counter() - request_started
-    logger.info(
-        "request:done filename=%s input=%s output=%s total_seconds=%.2f",
-        file.filename,
-        format_bytes(len(source_bytes)),
-        format_bytes(len(output_bytes)),
-        total_seconds,
-    )
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "x-output-filename": filename,
-        "x-original-size": format_bytes(len(source_bytes)),
-        "x-output-size": format_bytes(len(output_bytes)),
-        "x-percent-saved": str(percent_saved(len(source_bytes), len(output_bytes))),
-        "x-effective-stage": stats.get("x-effective-stage", "unknown"),
-        "x-processing-seconds": stats.get("x-processing-seconds", f"{total_seconds:.2f}"),
+def level_settings(level: str) -> dict:
+    level = (level or "recommended").lower()
+    if level == "light":
+        return {
+            "compress_streams": True,
+            "recompress_flate": False,
+            "linearize": True,
+            "object_stream_mode": pikepdf.ObjectStreamMode.generate,
+        }
+    if level == "strong":
+        return {
+            "compress_streams": True,
+            "recompress_flate": True,
+            "linearize": False,
+            "object_stream_mode": pikepdf.ObjectStreamMode.generate,
+        }
+    return {
+        "compress_streams": True,
+        "recompress_flate": True,
+        "linearize": True,
+        "object_stream_mode": pikepdf.ObjectStreamMode.generate,
     }
 
-    return StreamingResponse(
-        BytesIO(output_bytes),
-        media_type="application/pdf",
-        headers=headers,
-    )
+
+@app.post("/compress")
+async def compress_pdf(
+    file: UploadFile = File(...),
+    filename: str = Form("compressed-document.pdf"),
+    level: str = Form("recommended"),
+):
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file only.")
+
+    incoming = await file.read()
+    if not incoming:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if len(incoming) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large. Max size is 25 MB.")
+
+    safe_name = ensure_pdf_name(filename)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / "input.pdf"
+        output_path = temp_path / safe_name
+
+        input_path.write_bytes(incoming)
+
+        try:
+            with pikepdf.open(input_path) as pdf:
+                pdf.remove_unreferenced_resources()
+                pdf.save(output_path, **level_settings(level))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
+
+        if not output_path.exists():
+            raise HTTPException(status_code=500, detail="Compression failed: output file was not created.")
+
+        original_size = input_path.stat().st_size
+        output_size = output_path.stat().st_size
+        bytes_saved = max(original_size - output_size, 0)
+        percent_saved = int(round((bytes_saved / original_size) * 100)) if original_size else 0
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "x-output-filename": safe_name,
+            "x-original-size": str(original_size),
+            "x-output-size": str(output_size),
+            "x-percent-saved": str(percent_saved),
+            "x-bytes-saved": str(bytes_saved),
+            "Cache-Control": "no-store, max-age=0",
+        }
+
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            filename=safe_name,
+            headers=headers,
+        )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
